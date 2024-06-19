@@ -1,0 +1,26 @@
+name: Build-Lint-Test(Ubuntu-24.04)
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: build
+      run: cargo build --verbose
+
+    - name: cargo clippy 
+      run: cargo clippy --verbose
+
+    - name: cargo test
+      run: cargo test --verbose
