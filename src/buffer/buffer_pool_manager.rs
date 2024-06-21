@@ -1,8 +1,9 @@
 use std::{
     collections::LinkedList,
+    ops::DerefMut,
     sync::{
         atomic::{self, AtomicUsize},
-        Mutex, RwLock,
+        Mutex, RwLock, TryLockError,
     },
 };
 
@@ -14,18 +15,33 @@ use crate::{
 };
 
 pub trait BufferPoolManager {
+    /// Get the size of the buffer pool.
     fn get_pool_size(&self) -> usize;
+    /// Get the all pages in the buffer pool.
     fn get_pages(&self) -> &[RwLock<Page>];
+    /// Create a new page in the buffer pool, returning the page_id and the page,
+    /// or None if all frames are currently in use and not evictable (in another word, pinned)
+    /// Return Err if a disk manager emits an error.
     fn new_page(&self) -> anyhow::Result<Option<(PageId, &RwLock<Page>)>>;
+    /// Fetch the requested page from the buffer pool. Return None if page_id needs to be fetched from the disk
+    /// but all frames are curently in use and not evictable (in another word, pinned).
+    /// Return Err if a disk manager emits an error.
     fn fetch_page(&self, page_id: PageId) -> anyhow::Result<Option<&RwLock<Page>>>;
     /// Unpin the target page from the buffer pool. If page_id is not in the buffer pool or its pin count is already 0, return false.
     fn unpin_page(&self, page_id: PageId, is_dirty: bool) -> bool;
+    /// Use the DiskManager::write_page to flush a page to the disk, REGARDLESS of the dirty flag.
+    /// Unset the dirty flag of the page after flushing.
+    /// Return Err if a disk manager emits an error.
     fn flush_page(&self, page_id: PageId) -> anyhow::Result<bool>;
+    /// Flush all the pages in the buffer pool to disk.
+    /// Return Err if a disk manager emits an error.
     fn flush_all_pages(&self) -> anyhow::Result<()>;
+    /// Delete a page from the buffer pool. If page_id is not in the buffer pool, do nothing and return true. If the
+    /// page is pinned and cannot be deleted, return false immediately.
     fn delete_page(&self, page_id: PageId) -> bool;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct FrameId(usize);
 
 impl FrameId {
@@ -66,6 +82,49 @@ impl<'a> BufferPoolManagerImpl<'a> {
         free_list.pop_front()
     }
 
+    fn evict_page(&self) -> anyhow::Result<Option<FrameId>> {
+        for page in self.get_pages() {
+            let mut page_guard = match page.try_write() {
+                Ok(page_guard) => page_guard,
+                Err(TryLockError::WouldBlock) => continue,
+                Err(TryLockError::Poisoned(_)) => anyhow::bail!("poisoned lock"),
+            };
+
+            if page_guard.is_pinned() {
+                continue;
+            }
+
+            let Some(page_id) = page_guard.page_id() else {
+                continue;
+            };
+
+            if page_guard.is_dirty() {
+                self.flush_page_with_guard(page_id, &mut page_guard)?;
+            }
+
+            let Some((_, frame_id)) = self.page_table.remove(&page_id) else {
+                panic!("page_id is not in the page table");
+            };
+            page_guard.deallocate_page();
+            self.deallocate_page(page_id);
+
+            return Ok(Some(frame_id));
+        }
+
+        Ok(None)
+    }
+
+    fn flush_page_with_guard(
+        &self,
+        page_id: PageId,
+        page_guard: &mut impl DerefMut<Target = Page>,
+    ) -> anyhow::Result<()> {
+        self.disk_manager.write_page(page_id, page_guard.data())?;
+        page_guard.clear_dirty();
+
+        Ok(())
+    }
+
     fn allocate_page(&self) -> PageId {
         let page_id = self.next_page_id.fetch_add(1, atomic::Ordering::AcqRel);
         PageId::new(page_id)
@@ -86,9 +145,17 @@ impl<'a> BufferPoolManager for BufferPoolManagerImpl<'a> {
     }
 
     fn new_page(&self) -> anyhow::Result<Option<(PageId, &RwLock<Page>)>> {
-        let Some(frame_id) = self.free_frame() else {
-            // TODO: evict a unpinned page
-            return Ok(None);
+        let freed_frame = self.free_frame();
+        let frame_id = match freed_frame {
+            Some(frame_id) => frame_id,
+            None => {
+                // evict a page if possible
+                let Some(frame_id) = self.evict_page()? else {
+                    return Ok(None);
+                };
+
+                frame_id
+            }
         };
 
         let page_id = self.allocate_page();
@@ -110,9 +177,16 @@ impl<'a> BufferPoolManager for BufferPoolManagerImpl<'a> {
             return Ok(Some(page));
         }
 
-        let Some(frame_id) = self.free_frame() else {
-            // TODO: evict a unpinned page
-            return Ok(None);
+        let frame_id = match self.free_frame() {
+            Some(frame_id) => frame_id,
+            None => {
+                // evict a page if possible
+                let Some(frame_id) = self.evict_page()? else {
+                    return Ok(None);
+                };
+
+                frame_id
+            }
         };
 
         {
@@ -122,6 +196,7 @@ impl<'a> BufferPoolManager for BufferPoolManagerImpl<'a> {
                 .read_page(page_id, page_guard.data_mut())?;
 
             page_guard.allocate_page(page_id);
+            self.page_table.insert(page_id, frame_id);
 
             drop(page_guard);
         }
@@ -151,10 +226,8 @@ impl<'a> BufferPoolManager for BufferPoolManagerImpl<'a> {
             return Ok(false);
         };
         let mut page_guard = self.pages[frame_id.0].write().unwrap();
-        self.disk_manager.write_page(page_id, page_guard.data())?;
-        page_guard.clear_dirty();
+        self.flush_page_with_guard(page_id, &mut page_guard)?;
 
-        drop(page_guard);
         Ok(true)
     }
 
@@ -182,11 +255,18 @@ impl<'a> BufferPoolManager for BufferPoolManagerImpl<'a> {
         let mut free_list = self.free_list.lock().unwrap();
         free_list.push_back(*frame_id);
 
+        self.page_table.remove(&page_id);
         self.deallocate_page(page_id);
         page_guard.deallocate_page();
 
         drop(page_guard);
         true
+    }
+}
+
+impl Drop for BufferPoolManagerImpl<'_> {
+    fn drop(&mut self) {
+        self.flush_all_pages().unwrap();
     }
 }
 
@@ -283,6 +363,10 @@ mod tests {
                 page_guard.data(),
                 &random_binary_data,
                 "We should be able to fetch the data we wrote a while ago."
+            );
+            assert!(
+                page_guard.is_pinned(),
+                "The page should be pinned while we are reading it."
             );
         }
         assert!(
