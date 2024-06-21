@@ -5,34 +5,22 @@ use std::{
     sync::RwLock,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PageId(u64);
-
-impl PageId {
-    pub fn new(id: u64) -> Self {
-        Self(id)
-    }
-
-    pub fn offset(&self, page_size: u64) -> u64 {
-        self.0 * page_size
-    }
-}
+use crate::PageId;
 
 pub trait DiskManager: Sized + Sync + Send {
-    fn new(filename: impl AsRef<Path>) -> io::Result<Self>;
-    fn page_size(&self) -> u64;
+    fn new(page_size: usize, filename: impl AsRef<Path>) -> io::Result<Self>;
+    fn page_size(&self) -> usize;
     fn read_page(&self, page_id: PageId, data: &mut [u8]) -> anyhow::Result<()>;
     fn write_page(&self, page_id: PageId, data: &[u8]) -> anyhow::Result<()>;
 }
 
-pub const DEFAULT_PAGE_SIZE: u64 = 4096 * 2;
-
-pub struct BasicDiskManager<const PAGE_SIZE: u64> {
+pub struct BasicDiskManager {
+    page_size: usize,
     file: RwLock<File>,
 }
 
-impl<const PAGE_SIZE: u64> DiskManager for BasicDiskManager<PAGE_SIZE> {
-    fn new(filename: impl AsRef<Path>) -> io::Result<Self> {
+impl DiskManager for BasicDiskManager {
+    fn new(page_size: usize, filename: impl AsRef<Path>) -> io::Result<Self> {
         let file = if filename.as_ref().exists() {
             OpenOptions::new().read(true).append(true).open(filename)?
         } else {
@@ -44,16 +32,17 @@ impl<const PAGE_SIZE: u64> DiskManager for BasicDiskManager<PAGE_SIZE> {
                 .open(filename)?
         };
         Ok(Self {
+            page_size,
             file: RwLock::new(file),
         })
     }
 
-    fn page_size(&self) -> u64 {
-        PAGE_SIZE
+    fn page_size(&self) -> usize {
+        self.page_size
     }
 
     fn read_page(&self, page_id: PageId, data: &mut [u8]) -> anyhow::Result<()> {
-        let offset = page_id.offset(self.page_size());
+        let offset = page_id.offset(self.page_size()) as u64;
         let Ok(mut file) = self.file.write() else {
             anyhow::bail!("failed to acquire write lock");
         };
@@ -64,7 +53,7 @@ impl<const PAGE_SIZE: u64> DiskManager for BasicDiskManager<PAGE_SIZE> {
     }
 
     fn write_page(&self, page_id: PageId, data: &[u8]) -> anyhow::Result<()> {
-        let offset = page_id.0 * PAGE_SIZE;
+        let offset = page_id.offset(self.page_size()) as u64;
         let Ok(mut file) = self.file.write() else {
             anyhow::bail!("failed to acquire write lock");
         };
@@ -75,25 +64,21 @@ impl<const PAGE_SIZE: u64> DiskManager for BasicDiskManager<PAGE_SIZE> {
     }
 }
 
-pub type LimeBaseDiskManager = BasicDiskManager<{ DEFAULT_PAGE_SIZE }>;
+pub type LimeBaseDiskManager = BasicDiskManager;
 
 #[cfg(test)]
 mod tests {
+
+    use crate::storage::page::page::DEFAULT_PAGE_SIZE;
+
     use super::*;
     use rand::prelude::*;
 
     #[test]
-    fn test_page_id() {
-        let page_id = PageId::new(42);
-        assert_eq!(page_id.0, 42);
-        let page_size = 4096;
-        assert_eq!(page_id.offset(page_size), 42 * page_size);
-    }
-
-    #[test]
     fn test_basic_disk_manager_page_size() {
         let tempdir = tempfile::tempdir().unwrap();
-        let disk_manager = LimeBaseDiskManager::new(tempdir.path().join("test.db")).unwrap();
+        let disk_manager =
+            LimeBaseDiskManager::new(DEFAULT_PAGE_SIZE, tempdir.path().join("test.db")).unwrap();
         assert_eq!(disk_manager.page_size(), DEFAULT_PAGE_SIZE);
     }
 
@@ -101,22 +86,19 @@ mod tests {
     fn test_basic_disk_manager_read_write_page() {
         let mut rng = rand::thread_rng();
         let tempdir = tempfile::tempdir().unwrap();
-        let disk_manager = LimeBaseDiskManager::new(tempdir.path().join("test.db")).unwrap();
+        let disk_manager =
+            LimeBaseDiskManager::new(DEFAULT_PAGE_SIZE, tempdir.path().join("test.db")).unwrap();
         const N_PAGES: usize = 10;
         let mut data = [[0; DEFAULT_PAGE_SIZE as usize]; N_PAGES];
         for (i, page_buf) in data.iter_mut().enumerate() {
             rng.fill(page_buf.as_mut_slice());
-            disk_manager
-                .write_page(PageId::new(i as u64), page_buf)
-                .unwrap();
+            disk_manager.write_page(PageId::new(i), page_buf).unwrap();
         }
 
         for _ in 0..N_PAGES {
             let i = rng.gen_range(0..N_PAGES);
             let mut buf = [0; DEFAULT_PAGE_SIZE as usize];
-            disk_manager
-                .read_page(PageId::new(i as u64), &mut buf)
-                .unwrap();
+            disk_manager.read_page(PageId::new(i), &mut buf).unwrap();
             assert_eq!(buf, data[i]);
 
             // Randomly replace a page with new data
@@ -125,7 +107,7 @@ mod tests {
                 let random_page = rng.gen_range(0..N_PAGES);
                 rng.fill(data[random_page].as_mut_slice());
                 disk_manager
-                    .write_page(PageId::new(random_page as u64), &data[random_page])
+                    .write_page(PageId::new(random_page), &data[random_page])
                     .unwrap();
             }
         }
@@ -133,12 +115,11 @@ mod tests {
         drop(disk_manager);
 
         // Reopen the disk manager and check if the data is still there
-        let disk_manager = LimeBaseDiskManager::new(tempdir.path().join("test.db")).unwrap();
+        let disk_manager =
+            LimeBaseDiskManager::new(DEFAULT_PAGE_SIZE, tempdir.path().join("test.db")).unwrap();
         for i in 0..N_PAGES {
             let mut buf = [0; DEFAULT_PAGE_SIZE as usize];
-            disk_manager
-                .read_page(PageId::new(i as u64), &mut buf)
-                .unwrap();
+            disk_manager.read_page(PageId::new(i), &mut buf).unwrap();
             assert_eq!(buf, data[i]);
         }
     }
