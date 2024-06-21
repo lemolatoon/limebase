@@ -374,4 +374,96 @@ mod tests {
             "We should be able to unpin page0"
         );
     }
+
+    #[test]
+    fn test_sample() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let filename = tempdir.path().join("test.db");
+        const BUFFER_POOL_SIZE: usize = 10;
+        let disk_manager = LimeBaseDiskManager::new(DEFAULT_PAGE_SIZE, filename).unwrap();
+        let bpm = BufferPoolManagerImpl::new(BUFFER_POOL_SIZE, &disk_manager);
+
+        // The buffer pool is empty. We should be able to create a new page.
+        let (page_id0, page0) = bpm
+            .new_page()
+            .unwrap()
+            .expect("The buffer pool is empty. We should be able to create a new page.");
+        assert_eq!(
+            page_id0,
+            PageId::new(0),
+            "The buffer pool is empty. We should be able to create a new page."
+        );
+
+        // Once we have a page we should be able to read and write content.
+        let data = b"Hello";
+        page0.write().unwrap().data_mut()[0..data.len()].copy_from_slice(data);
+
+        // We should be able to create new pages until we fill up the buffer pool.
+        for i in 1..BUFFER_POOL_SIZE {
+            let (page_id, _) = bpm
+                .new_page()
+                .unwrap()
+                .expect("We should be able to create new pages until we fill up the buffer pool.");
+            assert_eq!(page_id, PageId::new(i));
+        }
+
+        // Once the buffer pool is full, we should not be able to create any new pages.
+        for _ in 0..(BUFFER_POOL_SIZE * 2) {
+            assert!(
+                bpm.new_page().unwrap().is_none(),
+                "Once the buffer pool is full, we should not be able to create any new pages."
+            );
+        }
+
+        // After pininng pages {0, 1, 2, 3, 4} and pinning after 4 new pages,
+        // there would still be one buffer page left for reading page 0.
+        for i in 0..5 {
+            assert!(
+                bpm.unpin_page(PageId::new(i), true),
+                "Page {} should be able to unpin",
+                i
+            );
+        }
+        for _ in 0..4 {
+            assert!(
+                bpm.new_page().unwrap().is_some(),
+                "We should be able to create new pages until we fill up the buffer pool, while one buffer left for reading page 0."
+            )
+        }
+
+        // We should be able to fetch the data we wrote a while ago.
+        let page0 = bpm
+            .fetch_page(page_id0)
+            .unwrap()
+            .expect("We should be able to fetch the data we wrote a while ago.");
+        assert_eq!(data, &page0.read().unwrap().data()[0..data.len()]);
+
+        // If we unpin page 0, and then make a new page, all the buffer pages should be pinned.
+        // Fetching page 0 again should be fail.
+        assert!(
+            bpm.unpin_page(page_id0, true),
+            "Page 0 should be able to unpin"
+        );
+        let new_page = bpm.new_page().unwrap();
+        assert!(
+            new_page.is_some(),
+            "We should be able to create a new page."
+        );
+        let (new_page_id, _) = new_page.unwrap();
+        assert!(
+            bpm.fetch_page(page_id0).unwrap().is_none(),
+            "Fetching page 0 should be fail."
+        );
+
+        // If we unpin one page, and then fetch page 0, now we should be able to fetch page 0, read content.
+        assert!(
+            bpm.unpin_page(new_page_id, true),
+            "Page 1 should be able to unpin"
+        );
+        let page0 = bpm
+            .fetch_page(page_id0)
+            .unwrap()
+            .expect("We should be able to fetch page 0 after unpinning one page.");
+        assert_eq!(data, &page0.read().unwrap().data()[0..data.len()]);
+    }
 }
